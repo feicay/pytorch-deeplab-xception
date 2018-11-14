@@ -1,3 +1,4 @@
+#use for DGX-1
 import socket
 import timeit
 from datetime import datetime
@@ -8,6 +9,7 @@ import numpy as np
 
 # PyTorch includes
 import torch
+import torch.nn as nn
 from torch.autograd import Variable
 import torch.optim as optim
 from torchvision import transforms
@@ -23,20 +25,20 @@ from dataloaders import utils
 from networks import deeplab_xception, deeplab_resnet
 from dataloaders import custom_transforms as tr
 
-gpu_id = 0
+gpu_id = 1
 print('Using GPU: {} '.format(gpu_id))
 # Setting parameters
 nEpochs = 100  # Number of epochs for training
 resume_epoch = 0  # Default is 0, change if want to resume
 
 p = OrderedDict()  # Parameters to include in report
-p['trainBatch'] = 4  # Training batch size
-testBatch = 4  # Testing batch size
+p['trainBatch'] = 32  # Training batch size
+testBatch = 8  # Testing batch size
 useTest = True  # See evolution of the test set when training
 nValInterval = 5  # Run on test set every nTestInterval epochs
 snapshot = 10  # Store a model every snapshot epochs
 p['nAveGrad'] = 1  # Average the gradient of several iterations
-p['lr'] = 1e-7  # Learning rate
+p['lr'] = 1e-6  # Learning rate
 p['wd'] = 5e-4  # Weight decay
 p['momentum'] = 0.9  # Momentum
 p['epoch_size'] = 10  # How many epochs to change learning rate
@@ -74,8 +76,7 @@ else:
                    map_location=lambda storage, loc: storage))  # Load all tensors onto the CPU
 
 if gpu_id >= 0:
-    torch.cuda.set_device(device=gpu_id)
-    net.cuda()
+    net = nn.DataParallel(net).cuda()  
 
 if resume_epoch != nEpochs:
     # Logging into Tensorboard
@@ -108,9 +109,9 @@ if resume_epoch != nEpochs:
     cityscapes_test = cityscapes.CityscapesSegmentation(split='test',
                                                         transform=composed_transforms_ts)
 
-    trainloader = DataLoader(cityscapes_train, batch_size=p['trainBatch'], shuffle=True, num_workers=0)
-    valloader = DataLoader(cityscapes_val, batch_size=testBatch, shuffle=True, num_workers=0)
-    testloader = DataLoader(cityscapes_test, batch_size=testBatch, shuffle=False, num_workers=0)
+    trainloader = DataLoader(cityscapes_train, batch_size=p['trainBatch'], drop_last=True, shuffle=True, num_workers=8)
+    valloader = DataLoader(cityscapes_val, batch_size=testBatch, drop_last=True, shuffle=True, num_workers=8)
+    testloader = DataLoader(cityscapes_test, batch_size=testBatch, drop_last=True, shuffle=False, num_workers=8)
 
     utils.generate_param_report(os.path.join(save_dir, exp_name + '.txt'), p)
 
