@@ -52,6 +52,8 @@ def get_pascal_labels():
                        [0, 64, 0], [128, 64, 0], [0, 192, 0], [128, 192, 0],
                        [0, 64, 128]])
 
+def get_bdd_drivable_labels():
+    return np.asarray([[0,0,0], [0,200,0], [0,0,200]])
 
 def encode_segmap(mask):
     """Encode segmentation label images as pascal classes
@@ -94,6 +96,9 @@ def decode_segmap(label_mask, dataset, plot=False):
     elif dataset == 'cityscapes':
         n_classes = 19
         label_colours = get_cityscapes_labels()
+    elif dataset == 'bdd_drivable':
+        n_classes = 3
+        label_colours = get_bdd_drivable_labels()
     else:
         raise NotImplementedError
 

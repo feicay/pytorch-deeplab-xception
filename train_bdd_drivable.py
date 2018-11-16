@@ -4,7 +4,6 @@ from datetime import datetime
 import os
 import glob
 from collections import OrderedDict
-import numpy as np
 
 # PyTorch includes
 import torch
@@ -15,26 +14,31 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 
+
 # Tensorboard include
 from tensorboardX import SummaryWriter
 
 # Custom includes
-from dataloaders import cityscapes
+from dataloaders import pascal, sbd, combine_dbs
 from dataloaders import utils
 from networks import deeplab_xception, deeplab_resnet
 from dataloaders import custom_transforms as tr
+from dataloaders import bdd_drivable as bdd
 
-gpu_id = 1
+
+gpu_id = 0
+num_gpus = 4
 print('Using GPU: {} '.format(gpu_id))
 # Setting parameters
+use_sbd = True  # Whether to use SBD dataset
 nEpochs = 100  # Number of epochs for training
-resume_epoch = 0  # Default is 0, change if want to resume
+resume_epoch = 0   # Default is 0, change if want to resume
 
 p = OrderedDict()  # Parameters to include in report
-p['trainBatch'] = 8  # Training batch size
-testBatch = 4  # Testing batch size
+p['trainBatch'] = 16  # Training batch size
+testBatch = 16  # Testing batch size
 useTest = True  # See evolution of the test set when training
-nValInterval = 5  # Run on test set every nTestInterval epochs
+nTestInterval = 5 # Run on test set every nTestInterval epochs
 snapshot = 10  # Store a model every snapshot epochs
 p['nAveGrad'] = 1  # Average the gradient of several iterations
 p['lr'] = 1e-7  # Learning rate
@@ -57,13 +61,15 @@ save_dir = os.path.join(save_dir_root, 'run', 'run_' + str(run_id))
 
 # Network definition
 if backbone == 'xception':
-    net = deeplab_xception.DeepLabv3_plus(nInputChannels=3, n_classes=19, os=16, pretrained=True)
+    net = deeplab_xception.DeepLabv3_plus(nInputChannels=3, n_classes=3, os=16, pretrained=True)
 elif backbone == 'resnet':
-    net = deeplab_resnet.DeepLabv3_plus(nInputChannels=3, n_classes=19, os=16, pretrained=True)
+    net = deeplab_resnet.DeepLabv3_plus(nInputChannels=3, n_classes=3, os=16, pretrained=True)
 else:
     raise NotImplementedError
-modelName = 'deeplabv3plus-' + backbone + '-cityscapes'
+
+modelName = 'deeplabv3plus-' + backbone + '-bdd'
 criterion = utils.cross_entropy2d
+
 
 if resume_epoch == 0:
     print("Training deeplabv3+ from scratch...")
@@ -72,12 +78,16 @@ else:
         os.path.join(save_dir, 'models', modelName + '_epoch-' + str(resume_epoch - 1) + '.pth')))
     net.load_state_dict(
         torch.load(os.path.join(save_dir, 'models', modelName + '_epoch-' + str(resume_epoch - 1) + '.pth'),
-                   map_location=lambda storage, loc: storage))  # Load all tensors onto the CPU
+                   map_location=lambda storage, loc: storage)) # Load all tensors onto the CPU
 
 if gpu_id >= 0:
-    #torch.cuda.set_device(device=gpu_id)
+    torch.cuda.set_device(device=gpu_id)
     #net.cuda()
+
+if num_gpus > 1:
     net = nn.DataParallel(net).cuda()  
+else:
+    net.cuda()
 
 if resume_epoch != nEpochs:
     # Logging into Tensorboard
@@ -89,40 +99,29 @@ if resume_epoch != nEpochs:
     p['optimizer'] = str(optimizer)
 
     composed_transforms_tr = transforms.Compose([
+        tr.RandomSized(512),
+        tr.RandomRotate(15),
         tr.RandomHorizontalFlip(),
-        tr.RandomScale((0.5, 0.75)),
-        tr.RandomCrop((512, 1024)),
-        tr.RandomRotate(5),
-        tr.Normalize_cityscapes(mean=(72.39, 82.91, 73.16)),
+        tr.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
         tr.ToTensor()])
 
     composed_transforms_ts = transforms.Compose([
-        tr.RandomHorizontalFlip(),
-        tr.Scale((819, 1638)),
-        tr.CenterCrop((512, 1024)),
-        tr.Normalize_cityscapes(mean=(72.39, 82.91, 73.16)),
+        tr.FixedResize(size=(512, 512)),
+        tr.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
         tr.ToTensor()])
 
-    cityscapes_train = cityscapes.CityscapesSegmentation(split='train',
-                                                         transform=composed_transforms_tr)
-    cityscapes_val = cityscapes.CityscapesSegmentation(split='val',
-                                                       transform=composed_transforms_ts)
-    cityscapes_test = cityscapes.CityscapesSegmentation(split='test',
-                                                        transform=composed_transforms_ts)
+    bdd_train = bdd.bdd_drivable_map(split='train', transform=composed_transforms_tr)
+    bdd_val = bdd.bdd_drivable_map(split='val', transform=composed_transforms_ts)
 
-    trainloader = DataLoader(cityscapes_train, batch_size=p['trainBatch'], drop_last=True, shuffle=True, num_workers=4)
-    valloader = DataLoader(cityscapes_val, batch_size=testBatch, drop_last=True, shuffle=True, num_workers=4)
-    testloader = DataLoader(cityscapes_test, batch_size=testBatch, drop_last=True, shuffle=False, num_workers=4)
+    trainloader = DataLoader(bdd_train, batch_size=p['trainBatch'], drop_last=True, shuffle=True, num_workers=4)
+    testloader = DataLoader(bdd_val, batch_size=testBatch, drop_last=True, shuffle=False, num_workers=4)
 
     utils.generate_param_report(os.path.join(save_dir, exp_name + '.txt'), p)
 
     num_img_tr = len(trainloader)
-    num_img_vl = len(valloader)
     num_img_ts = len(testloader)
     running_loss_tr = 0.0
-    running_loss_vl = 0.0
     running_loss_ts = 0.0
-    previous_miou = -1.0
     aveGrad = 0
     global_step = 0
     print("Training Network")
@@ -178,21 +177,22 @@ if resume_epoch != nEpochs:
             if ii % (num_img_tr // 10) == 0:
                 grid_image = make_grid(inputs[:3].clone().cpu().data, 3, normalize=True)
                 writer.add_image('Image', grid_image, global_step)
-                grid_image = make_grid(
-                    utils.decode_seg_map_sequence(torch.max(outputs[:3], 1)[1].detach().cpu().numpy(), 'cityscapes'), 3,
-                    normalize=False,
-                    range=(0, 255))
+                grid_image = make_grid(utils.decode_seg_map_sequence(torch.max(outputs[:3], 1)[1].detach().cpu().numpy(), 'bdd_drivable'), 3, normalize=False,
+                                       range=(0, 255))
                 writer.add_image('Predicted label', grid_image, global_step)
-                grid_image = make_grid(
-                    utils.decode_seg_map_sequence(torch.squeeze(labels[:3], 1).detach().cpu().numpy(), 'cityscapes'), 3,
-                    normalize=False, range=(0, 255))
+                grid_image = make_grid(utils.decode_seg_map_sequence(torch.squeeze(labels[:3], 1).detach().cpu().numpy(), 'bdd_drivable'), 3, normalize=False, range=(0, 255))
                 writer.add_image('Groundtruth label', grid_image, global_step)
 
+        # Save the model
+        if (epoch % snapshot) == snapshot - 1:
+            torch.save(net.state_dict(), os.path.join(save_dir, 'models', modelName + '_epoch-' + str(epoch) + '.pth'))
+            print("Save model at {}\n".format(os.path.join(save_dir, 'models', modelName + '_epoch-' + str(epoch) + '.pth')))
+
         # One testing epoch
-        if epoch % nValInterval == (nValInterval - 1):
-            total_miou = 0.0
+        if useTest and epoch % nTestInterval == (nTestInterval - 1):
+            total_iou = 0.0
             net.eval()
-            for ii, sample_batched in enumerate(valloader):
+            for ii, sample_batched in enumerate(testloader):
                 inputs, labels = sample_batched['image'], sample_batched['label']
 
                 # Forward pass of the mini-batch
@@ -206,58 +206,23 @@ if resume_epoch != nEpochs:
                 predictions = torch.max(outputs, 1)[1]
 
                 loss = criterion(outputs, labels, size_average=False, batch_average=True)
-                running_loss_vl += loss.item()
-                total_miou += utils.get_iou(predictions, labels, 19)
+                running_loss_ts += loss.item()
+
+                total_iou += utils.get_iou(predictions, labels)
 
                 # Print stuff
-                if ii % num_img_vl == num_img_vl - 1:
-                    miou = total_miou / (ii * testBatch + inputs.data.shape[0])
-                    running_loss_vl = running_loss_vl / num_img_vl
+                if ii % num_img_ts == num_img_ts - 1:
+
+                    miou = total_iou / (ii * testBatch + inputs.data.shape[0])
+                    running_loss_ts = running_loss_ts / num_img_ts
 
                     print('Validation:')
                     print('[Epoch: %d, numImages: %5d]' % (epoch, ii * testBatch + inputs.data.shape[0]))
-                    writer.add_scalar('data/test_loss_epoch', running_loss_vl, epoch)
+                    writer.add_scalar('data/test_loss_epoch', running_loss_ts, epoch)
                     writer.add_scalar('data/test_miour', miou, epoch)
-                    print('Loss: %f' % running_loss_vl)
+                    print('Loss: %f' % running_loss_ts)
                     print('MIoU: %f\n' % miou)
-                    running_loss_vl = 0
+                    running_loss_ts = 0
 
-        # Save the model
-        if (epoch % snapshot) == snapshot - 1 and miou > previous_miou:
-            previous_miou = miou
-            torch.save(net.state_dict(), os.path.join(save_dir, 'models', modelName + '_epoch-' + str(epoch) + '.pth'))
-            print("Save model at {}\n".format(
-                os.path.join(save_dir, 'models', modelName + '_epoch-' + str(epoch) + '.pth')))
 
     writer.close()
-
-    if useTest:
-        total_iou = 0.0
-        net.eval()
-        for ii, sample_batched in enumerate(testloader):
-            inputs, labels = sample_batched['image'], sample_batched['label']
-
-            # Forward pass of the mini-batch
-            inputs, labels = Variable(inputs, requires_grad=True), Variable(labels)
-            if gpu_id >= 0:
-                inputs, labels = inputs.cuda(), labels.cuda()
-
-            with torch.no_grad():
-                outputs = net.forward(inputs)
-
-            predictions = torch.max(outputs, 1)[1]
-
-            loss = criterion(outputs, labels, size_average=False, batch_average=True)
-            running_loss_ts += loss.item()
-
-            total_iou += utils.get_iou(predictions, labels, 19)
-
-            # Print stuff
-            if ii % num_img_ts == num_img_ts - 1:
-                miou = total_iou / (ii * testBatch + inputs.data.shape[0])
-                running_loss_ts = running_loss_ts / num_img_ts
-
-                print('Test:')
-                print('Loss: %f' % running_loss_ts)
-                print('MIoU: %f\n' % miou)
-                running_loss_ts = 0
